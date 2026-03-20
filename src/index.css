@@ -1,0 +1,45 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800;900&family=Inter:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Outfit", sans-serif;
+  
+  --color-globe-blue: #0ea5e9;
+  --color-globe-green: #10b981;
+  --color-globe-yellow: #f59e0b;
+  --color-globe-orange: #f97316;
+  --color-globe-deep: #1e3a8a;
+}
+
+@layer base {
+  body {
+    @apply font-sans antialiased bg-slate-50 text-slate-900;
+  }
+  
+  h1, h2, h3, h4 {
+    @apply font-display;
+  }
+}
+
+.globe-spin {
+  animation: spin 20s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.bubbly-button {
+  @apply relative overflow-hidden transition-all duration-300 active:scale-95;
+}
+
+.bubbly-button::after {
+  content: '';
+  @apply absolute inset-0 bg-white/20 opacity-0 transition-opacity duration-300;
+}
+
+.bubbly-button:hover::after {
+  @apply opacity-100;
+}
