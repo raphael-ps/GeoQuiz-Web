@@ -27,10 +27,36 @@ async function startServer() {
   });
 
   // Multiplayer Logic
-  const rooms = new Map<string, { players: any[], status: string, currentQuestion?: any }>();
+  const MAX_ROUNDS = 10;
+  const rooms = new Map<string, { 
+    players: any[], 
+    status: string, 
+    roundAnswers: Record<string, any>,
+    readyForNext: string[],
+    currentRound: number
+  }>();
+
+  // Global Rankings (In-memory for this session)
+  let globalRankings: any[] = [];
 
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
+
+    // Send current rankings on connection
+    socket.emit("update-rankings", globalRankings);
+
+    socket.on("save-ranking", (entry) => {
+      globalRankings.push(entry);
+      // Keep only top 100 and sort by score (desc) then time (asc)
+      globalRankings.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.totalTime - b.totalTime;
+      });
+      globalRankings = globalRankings.slice(0, 100);
+      
+      // Broadcast updated rankings to all connected clients
+      io.emit("update-rankings", globalRankings);
+    });
 
     socket.on("join-duel", ({ playerName, roomId: requestedRoomId }) => {
       let roomToJoin = null;
@@ -42,7 +68,13 @@ async function startServer() {
         } else if (!room) {
           // Create the requested room if it doesn't exist
           const roomId = requestedRoomId;
-          rooms.set(roomId, { players: [{ id: socket.id, name: playerName, score: 0 }], status: "waiting" });
+          rooms.set(roomId, { 
+            players: [{ id: socket.id, name: playerName, score: 0 }], 
+            status: "waiting",
+            roundAnswers: {},
+            readyForNext: [],
+            currentRound: 1
+          });
           socket.join(roomId);
           socket.emit("waiting-for-opponent", { roomId });
           return;
@@ -62,10 +94,23 @@ async function startServer() {
         room.players.push({ id: socket.id, name: playerName, score: 0 });
         room.status = "starting";
         socket.join(roomToJoin);
-        io.to(roomToJoin).emit("duel-ready", { roomId: roomToJoin, players: room.players });
+        // Pick a random country index to sync both players
+        const countryIndex = Math.floor(Math.random() * 250); 
+        io.to(roomToJoin).emit("duel-ready", { 
+          roomId: roomToJoin, 
+          players: room.players, 
+          countryIndex,
+          maxRounds: MAX_ROUNDS 
+        });
       } else {
         const roomId = requestedRoomId || `room-${socket.id}`;
-        rooms.set(roomId, { players: [{ id: socket.id, name: playerName, score: 0 }], status: "waiting" });
+        rooms.set(roomId, { 
+          players: [{ id: socket.id, name: playerName, score: 0 }], 
+          status: "waiting",
+          roundAnswers: {},
+          readyForNext: [],
+          currentRound: 1
+        });
         socket.join(roomId);
         socket.emit("waiting-for-opponent", { roomId });
       }
@@ -73,17 +118,80 @@ async function startServer() {
 
     socket.on("submit-answer", ({ roomId, isCorrect, timeSpent }) => {
       const room = rooms.get(roomId);
-      if (room) {
-        const player = room.players.find(p => p.id === socket.id);
-        if (player && isCorrect) {
-          player.score += Math.max(1, 10 - Math.floor(timeSpent / 2));
+      if (room && !room.roundAnswers[socket.id]) {
+        room.roundAnswers[socket.id] = { isCorrect, timeSpent, timestamp: Date.now() };
+        
+        // If both players answered
+        if (Object.keys(room.roundAnswers).length === room.players.length) {
+          const playerIds = Object.keys(room.roundAnswers);
+          const results: any = {};
+          
+          // Determine who was first among correct answers
+          let firstCorrectId: string | null = null;
+          let earliestTimestamp = Infinity;
+
+          playerIds.forEach(id => {
+            if (room.roundAnswers[id].isCorrect && room.roundAnswers[id].timestamp < earliestTimestamp) {
+              earliestTimestamp = room.roundAnswers[id].timestamp;
+              firstCorrectId = id;
+            }
+          });
+
+          // Calculate scores
+          room.players.forEach(player => {
+            const answer = room.roundAnswers[player.id];
+            let points = 0;
+            if (answer.isCorrect) {
+              // Base points based on time
+              const basePoints = Math.max(5, 10 - Math.floor(answer.timeSpent / 2));
+              points = basePoints;
+              
+              // Bonus for being first
+              if (player.id === firstCorrectId) {
+                points += 5;
+              }
+            }
+            player.score += points;
+            results[player.id] = { points, isCorrect: answer.isCorrect };
+          });
+
+          io.to(roomId).emit("round-results", { results, players: room.players });
+          room.roundAnswers = {}; // Reset for next round
+          room.readyForNext = []; // Reset ready status
+        } else {
+          // Just notify that one player answered
+          io.to(roomId).emit("player-answered", { playerId: socket.id });
         }
-        io.to(roomId).emit("duel-update", { players: room.players });
       }
     });
 
     socket.on("next-round", (roomId) => {
-      io.to(roomId).emit("start-next-round");
+      const room = rooms.get(roomId);
+      if (room && !room.readyForNext.includes(socket.id)) {
+        room.readyForNext.push(socket.id);
+        
+        io.to(roomId).emit("next-round-status", { 
+          readyCount: room.readyForNext.length, 
+          totalCount: room.players.length 
+        });
+
+        if (room.readyForNext.length === room.players.length) {
+          if (room.currentRound >= MAX_ROUNDS) {
+            io.to(roomId).emit("duel-over", { players: room.players });
+            room.status = "waiting";
+            room.currentRound = 1;
+            room.readyForNext = [];
+          } else {
+            room.currentRound++;
+            const countryIndex = Math.floor(Math.random() * 250);
+            io.to(roomId).emit("start-next-round", { 
+              countryIndex, 
+              currentRound: room.currentRound 
+            });
+            room.readyForNext = [];
+          }
+        }
+      }
     });
 
     socket.on("leave-room", (roomId) => {

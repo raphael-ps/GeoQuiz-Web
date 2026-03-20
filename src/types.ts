@@ -58,6 +58,12 @@ export interface GameState {
   achievements: string[];
   multiplayerRoomId?: string;
   opponent?: { name: string; score: number };
+  roundResults?: { [playerId: string]: { points: number, isCorrect: boolean } };
+  opponentAnswered?: boolean;
+  readyCount?: number;
+  totalCount?: number;
+  currentRound?: number;
+  maxRounds?: number;
 }
 
 export interface Achievement {

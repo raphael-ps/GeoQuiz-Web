@@ -159,16 +159,91 @@ export default function App() {
       setGameState(prev => ({ ...prev, multiplayerRoomId: roomId }));
     });
 
-    newSocket.on("duel-ready", ({ roomId, players }) => {
+    newSocket.on("duel-ready", ({ roomId, players, countryIndex, maxRounds }) => {
       const opponent = players.find((p: any) => p.id !== newSocket.id);
       setGameState(prev => ({
         ...prev,
         gameStatus: 'multiplayer-game',
         multiplayerRoomId: roomId,
-        opponent: { name: opponent?.name || 'Opponent', score: 0 }
+        opponent: { name: opponent?.name || 'Opponent', score: 0 },
+        roundResults: undefined,
+        opponentAnswered: false,
+        readyCount: 0,
+        totalCount: 2,
+        currentRound: 1,
+        maxRounds: maxRounds
       }));
       setMultiplayerStatus('ready');
-      startMultiplayerGame();
+      startMultiplayerGame(countryIndex);
+    });
+
+    newSocket.on("round-results", ({ results, players }) => {
+      const opponent = players.find((p: any) => p.id !== newSocket.id);
+      const me = players.find((p: any) => p.id === newSocket.id);
+      
+      setGameState(prev => ({
+        ...prev,
+        score: me.score,
+        opponent: { ...prev.opponent!, score: opponent.score },
+        roundResults: results,
+        opponentAnswered: true
+      }));
+
+      const myResult = results[newSocket.id];
+      if (myResult && myResult.isCorrect) {
+        confetti({
+          particleCount: 100,
+          spread: 70,
+          origin: { y: 0.6 }
+        });
+      }
+
+      // If I haven't answered yet (time ran out), I should see the results now
+      if (isCorrect === null) {
+        setIsCorrect(myResult.isCorrect);
+      }
+    });
+
+    newSocket.on("player-answered", ({ playerId }) => {
+      if (playerId !== newSocket.id) {
+        setGameState(prev => ({ ...prev, opponentAnswered: true }));
+      }
+    });
+
+    newSocket.on("next-round-status", ({ readyCount, totalCount }) => {
+      setGameState(prev => ({ ...prev, readyCount, totalCount }));
+    });
+
+    newSocket.on("start-next-round", ({ countryIndex, currentRound }) => {
+      const nextCountry = COUNTRIES[countryIndex % COUNTRIES.length];
+      setGameState(prev => ({
+        ...prev,
+        isBonusPhase: false,
+        currentCountry: nextCountry,
+        currentQuestion: generateFlagQuestion(nextCountry, 'countries'),
+        history: [...prev.history, nextCountry.id],
+        isFlagRevealed: false,
+        roundResults: undefined,
+        opponentAnswered: false,
+        readyCount: 0,
+        currentRound: currentRound || prev.currentRound
+      }));
+      setTimeLeft(QUESTION_TIME);
+      setSelectedOption(null);
+      setGuessInput('');
+      setIsCorrect(null);
+    });
+
+    newSocket.on("duel-over", ({ players }) => {
+      const me = players.find((p: any) => p.id === newSocket.id);
+      const opponent = players.find((p: any) => p.id !== newSocket.id);
+      
+      setGameState(prev => ({
+        ...prev,
+        gameStatus: 'gameover',
+        score: me.score,
+        opponent: { ...prev.opponent!, score: opponent.score }
+      }));
     });
 
     newSocket.on("duel-update", ({ players }) => {
@@ -179,6 +254,10 @@ export default function App() {
           opponent: prev.opponent ? { ...prev.opponent, score: opponent.score } : { name: opponent.name, score: opponent.score }
         }));
       }
+    });
+
+    newSocket.on("update-rankings", (updatedRankings: RankingEntry[]) => {
+      setRankings(updatedRankings);
     });
 
     newSocket.on("player-left", () => {
@@ -210,10 +289,6 @@ export default function App() {
   }, [gameState]);
 
   useEffect(() => {
-    const savedRankings = localStorage.getItem('geoquiz_rankings');
-    if (savedRankings) {
-      setRankings(JSON.parse(savedRankings));
-    }
     const savedName = localStorage.getItem('geoquiz_player_name');
     if (savedName) {
       setPlayerName(savedName);
@@ -230,15 +305,18 @@ export default function App() {
       date: new Date().toLocaleDateString()
     };
 
+    // Emit to server for global sync
+    socket?.emit("save-ranking", newEntry);
+
+    // Also keep local for immediate feedback (will be overwritten by server broadcast)
     const updatedRankings = [newEntry, ...rankings]
       .sort((a, b) => {
         if (b.score !== a.score) return b.score - a.score;
-        return a.totalTime - b.totalTime; // Tie-breaker: less time is better
+        return a.totalTime - b.totalTime;
       })
-      .slice(0, 20); // Keep more entries since we have multiple difficulties
+      .slice(0, 100);
 
     setRankings(updatedRankings);
-    localStorage.setItem('geoquiz_rankings', JSON.stringify(updatedRankings));
     localStorage.setItem('geoquiz_player_name', finalName);
     setHasSaved(true);
     
@@ -308,8 +386,8 @@ export default function App() {
     }
   };
 
-  const startMultiplayerGame = () => {
-    const firstCountry = COUNTRIES[Math.floor(Math.random() * COUNTRIES.length)];
+  const startMultiplayerGame = (countryIndex?: number) => {
+    const firstCountry = countryIndex !== undefined ? COUNTRIES[countryIndex % COUNTRIES.length] : COUNTRIES[Math.floor(Math.random() * COUNTRIES.length)];
     setGameState(prev => ({
       ...prev,
       gameStatus: 'multiplayer-game',
@@ -581,38 +659,40 @@ export default function App() {
 
     if (isCorrectGuess) {
       playSound('correct', isMuted);
-      let points = gameState.isBonusPhase ? BONUS_POINTS : FLAG_POINTS;
-      if (gameState.isFlagRevealed && !gameState.isBonusPhase) {
-        points = Math.max(1, points - REVEAL_PENALTY);
-      }
       
-      setGameState(prev => ({ 
-        ...prev, 
-        score: prev.score + points,
-        totalTime: prev.totalTime + timeSpent,
-        correctPrimary: prev.isBonusPhase ? prev.correctPrimary : prev.correctPrimary + 1,
-        correctBonus: prev.isBonusPhase ? prev.correctBonus + 1 : prev.correctBonus
-      }));
+      if (gameState.mode !== 'multiplayer') {
+        let points = gameState.isBonusPhase ? BONUS_POINTS : FLAG_POINTS;
+        if (gameState.isFlagRevealed && !gameState.isBonusPhase) {
+          points = Math.max(1, points - REVEAL_PENALTY);
+        }
+        
+        setGameState(prev => ({ 
+          ...prev, 
+          score: prev.score + points,
+          totalTime: prev.totalTime + timeSpent,
+          correctPrimary: prev.isBonusPhase ? prev.correctPrimary : prev.correctPrimary + 1,
+          correctBonus: prev.isBonusPhase ? prev.correctBonus + 1 : prev.correctBonus
+        }));
 
-      if (gameState.mode === 'multiplayer') {
+        confetti({
+          particleCount: 100,
+          spread: 70,
+          origin: { y: 0.6 }
+        });
+      } else {
         socket?.emit("submit-answer", { roomId: gameState.multiplayerRoomId, isCorrect: true, timeSpent });
       }
-
-      confetti({
-        particleCount: 100,
-        spread: 70,
-        origin: { y: 0.6 }
-      });
     } else {
       playSound('wrong', isMuted);
-      setGameState(prev => ({
-        ...prev,
-        totalTime: prev.totalTime + timeSpent,
-        wrongPrimary: prev.isBonusPhase ? prev.wrongPrimary : prev.wrongPrimary + 1,
-        wrongBonus: prev.isBonusPhase ? prev.wrongBonus + 1 : prev.wrongBonus,
-        lives: !prev.isBonusPhase ? prev.lives - 1 : prev.lives
-      }));
-      if (gameState.mode === 'multiplayer') {
+      if (gameState.mode !== 'multiplayer') {
+        setGameState(prev => ({
+          ...prev,
+          totalTime: prev.totalTime + timeSpent,
+          wrongPrimary: prev.isBonusPhase ? prev.wrongPrimary : prev.wrongPrimary + 1,
+          wrongBonus: prev.isBonusPhase ? prev.wrongBonus + 1 : prev.wrongBonus,
+          lives: !prev.isBonusPhase ? prev.lives - 1 : prev.lives
+        }));
+      } else {
         socket?.emit("submit-answer", { roomId: gameState.multiplayerRoomId, isCorrect: false, timeSpent });
       }
     }
@@ -1075,7 +1155,9 @@ export default function App() {
                       <div className="h-4 w-[1px] bg-slate-100" />
                       <div className="flex items-center gap-2">
                         <span className="font-black text-slate-700">{gameState.opponent?.score || 0}</span>
-                        <div className="w-8 h-8 bg-purple-100 rounded-lg flex items-center justify-center text-purple-600 font-black text-xs">OPP</div>
+                        <div className="px-2 h-8 bg-purple-100 rounded-lg flex items-center justify-center text-purple-600 font-black text-[10px] uppercase tracking-tighter">
+                          {gameState.opponent?.name.split(' ')[0].substring(0, 6) || 'OPP'}
+                        </div>
                       </div>
                     </div>
                     <div className={`w-12 h-12 rounded-full flex items-center justify-center font-black text-lg border-4 shrink-0 ${timeLeft < 5 ? 'bg-red-50 border-red-200 text-red-500 animate-pulse' : 'bg-white border-slate-100 text-slate-700'}`}>
@@ -1223,12 +1305,54 @@ export default function App() {
                         {isCorrect && gameState.isBonusPhase && gameState.currentCountry?.fact && (
                           <p className="text-sm text-slate-500 italic mt-1">"{gameState.currentCountry.fact}"</p>
                         )}
+                        
+                        {gameState.mode === 'multiplayer' && !gameState.roundResults && (
+                          <p className="text-xs font-bold text-slate-400 mt-2 animate-pulse">
+                            WAITING FOR OPPONENT...
+                          </p>
+                        )}
+
+                        {gameState.mode === 'multiplayer' && gameState.roundResults && (
+                          <div className="mt-4 p-3 bg-white rounded-2xl border border-slate-200 shadow-sm w-full max-w-xs space-y-2">
+                            <div className="flex justify-between items-center">
+                              <span className="text-xs font-bold text-slate-500 uppercase">You</span>
+                              <span className={`text-sm font-black ${gameState.roundResults[socket?.id || ''].isCorrect ? 'text-green-500' : 'text-red-500'}`}>
+                                +{gameState.roundResults[socket?.id || ''].points}
+                              </span>
+                            </div>
+                            <div className="h-[1px] bg-slate-100" />
+                            <div className="flex justify-between items-center">
+                              <span className="text-xs font-bold text-slate-500 uppercase">{gameState.opponent?.name}</span>
+                              <span className={`text-sm font-black ${gameState.roundResults[Object.keys(gameState.roundResults).find(id => id !== socket?.id) || ''].isCorrect ? 'text-green-500' : 'text-red-500'}`}>
+                                +{gameState.roundResults[Object.keys(gameState.roundResults).find(id => id !== socket?.id) || ''].points}
+                              </span>
+                            </div>
+                          </div>
+                        )}
+                        {gameState.mode === 'multiplayer' && gameState.currentRound && gameState.maxRounds && (
+                          <div className="flex items-center gap-2 px-3 py-1 bg-slate-100 rounded-full">
+                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Round</span>
+                            <span className="text-xs font-black text-slate-600">{gameState.currentRound}/{gameState.maxRounds}</span>
+                          </div>
+                        )}
                       </div>
                       <button 
-                        onClick={nextTurn}
-                        className="bubbly-button bg-slate-900 text-white px-10 py-4 rounded-2xl font-black text-lg flex items-center gap-2 shadow-xl"
+                        onClick={() => {
+                          if (gameState.mode === 'multiplayer') {
+                            socket?.emit("next-round", gameState.multiplayerRoomId);
+                          } else {
+                            nextTurn();
+                          }
+                        }}
+                        disabled={gameState.mode === 'multiplayer' && !gameState.roundResults}
+                        className={`bubbly-button bg-slate-900 text-white px-10 py-4 rounded-2xl font-black text-lg flex items-center gap-2 shadow-xl ${gameState.mode === 'multiplayer' && !gameState.roundResults ? 'opacity-50 cursor-not-allowed' : ''}`}
                       >
-                        {gameState.lives <= 0 ? 'FINISH' : (isCorrect && !gameState.isBonusPhase ? 'BONUS ROUND!' : 'NEXT MISSION')}
+                        {gameState.lives <= 0 ? 'FINISH' : (gameState.mode === 'multiplayer' ? 'NEXT MISSION' : (isCorrect && !gameState.isBonusPhase ? 'BONUS ROUND!' : 'NEXT MISSION'))}
+                        {gameState.mode === 'multiplayer' && gameState.readyCount !== undefined && gameState.readyCount > 0 && (
+                          <span className="ml-2 text-xs bg-white/20 px-2 py-1 rounded-full">
+                            {gameState.readyCount}/{gameState.totalCount}
+                          </span>
+                        )}
                         <ChevronRight className="w-6 h-6" />
                       </button>
                     </motion.div>
@@ -1247,90 +1371,120 @@ export default function App() {
             >
               <div className="bg-white p-10 rounded-[2.5rem] shadow-2xl border border-slate-100 text-center space-y-8">
                 <div className="relative inline-block">
-                  <div className="w-24 h-24 bg-red-50 rounded-full flex items-center justify-center text-red-500 mx-auto border-4 border-white shadow-lg">
-                    <RotateCcw className="w-12 h-12" />
+                  <div className={`w-24 h-24 rounded-full flex items-center justify-center mx-auto border-4 border-white shadow-lg ${gameState.mode === 'multiplayer' ? (gameState.opponent && gameState.score > gameState.opponent.score ? 'bg-globe-green text-white' : 'bg-globe-blue text-white') : 'bg-red-50 text-red-500'}`}>
+                    {gameState.mode === 'multiplayer' ? (
+                      gameState.opponent && gameState.score > gameState.opponent.score ? <Trophy className="w-12 h-12" /> : <Award className="w-12 h-12" />
+                    ) : (
+                      <RotateCcw className="w-12 h-12" />
+                    )}
                   </div>
                   <div className="absolute -bottom-2 -right-2 bg-slate-900 text-white p-2 rounded-full shadow-lg">
-                    <XCircle className="w-6 h-6" />
+                    {gameState.mode === 'multiplayer' ? <Users className="w-6 h-6" /> : <XCircle className="w-6 h-6" />}
                   </div>
                 </div>
 
                 <div className="space-y-2">
-                  <h2 className="text-4xl font-black text-slate-800">Journey's End!</h2>
-                  <p className="text-slate-400 font-medium">You've explored {gameState.history.length} countries.</p>
+                  <h2 className="text-4xl font-black text-slate-800">
+                    {gameState.mode === 'multiplayer' ? (
+                      gameState.opponent && gameState.score > gameState.opponent.score ? 'VICTORY!' : 
+                      gameState.opponent && gameState.score < gameState.opponent.score ? 'DEFEAT!' : 'IT\'S A TIE!'
+                    ) : 'Journey\'s End!'}
+                  </h2>
+                  <p className="text-slate-400 font-medium">
+                    {gameState.mode === 'multiplayer' ? 'The duel has concluded.' : `You've explored ${gameState.history.length} countries.`}
+                  </p>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="bg-slate-50 p-6 rounded-3xl border border-slate-100 shadow-inner">
-                    <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-1">Total Score</p>
-                    <p className="text-5xl font-black text-globe-blue">{gameState.score}</p>
-                  </div>
-                  <div className="bg-slate-50 p-6 rounded-3xl border border-slate-100 shadow-inner">
-                    <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-1">Total Time</p>
-                    <p className="text-5xl font-black text-globe-orange">{formatTime(gameState.totalTime)}</p>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4 text-left">
-                  <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Primary Questions</p>
-                    <div className="flex justify-between items-center">
-                      <div className="flex items-center gap-1 text-globe-green">
-                        <CheckCircle2 className="w-4 h-4" />
-                        <span className="font-bold">{gameState.correctPrimary}</span>
+                {gameState.mode === 'multiplayer' ? (
+                  <div className="grid grid-cols-1 gap-4">
+                    <div className="flex items-center justify-between bg-slate-50 p-6 rounded-3xl border border-slate-100 shadow-inner">
+                      <div className="text-left">
+                        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">You</p>
+                        <p className="text-3xl font-black text-globe-blue">{gameState.score}</p>
                       </div>
-                      <div className="flex items-center gap-1 text-red-500">
-                        <XCircle className="w-4 h-4" />
-                        <span className="font-bold">{gameState.wrongPrimary}</span>
+                      <div className="text-right">
+                        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">{gameState.opponent?.name}</p>
+                        <p className="text-3xl font-black text-purple-600">{gameState.opponent?.score}</p>
                       </div>
                     </div>
                   </div>
-                  <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Bonus Questions</p>
-                    <div className="flex justify-between items-center">
-                      <div className="flex items-center gap-1 text-globe-yellow">
-                        <Star className="w-4 h-4 fill-globe-yellow" />
-                        <span className="font-bold">{gameState.correctBonus}</span>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="bg-slate-50 p-6 rounded-3xl border border-slate-100 shadow-inner">
+                        <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-1">Total Score</p>
+                        <p className="text-5xl font-black text-globe-blue">{gameState.score}</p>
                       </div>
-                      <div className="flex items-center gap-1 text-slate-300">
-                        <XCircle className="w-4 h-4" />
-                        <span className="font-bold">{gameState.wrongBonus}</span>
+                      <div className="bg-slate-50 p-6 rounded-3xl border border-slate-100 shadow-inner">
+                        <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-1">Total Time</p>
+                        <p className="text-5xl font-black text-globe-orange">{formatTime(gameState.totalTime)}</p>
                       </div>
                     </div>
-                  </div>
-                </div>
 
-                <div className="space-y-4">
-                  <div className="relative">
-                    <User className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
-                    <input 
-                      type="text"
-                      placeholder="Your Explorer Name"
-                      value={playerName}
-                      onChange={(e) => {
-                        setPlayerName(e.target.value);
-                        localStorage.setItem('geoquiz_player_name', e.target.value);
-                      }}
-                      className="w-full pl-14 pr-5 py-4 bg-slate-50 border-2 border-slate-100 rounded-2xl focus:border-globe-blue focus:ring-0 transition-all font-bold text-lg text-slate-800"
-                    />
-                  </div>
-                  <button 
-                    onClick={() => saveScore(gameState.score, gameState.totalTime, gameState.difficulty, playerName)}
-                    disabled={hasSaved}
-                    className={`bubbly-button w-full py-4 rounded-2xl font-black text-lg shadow-lg transition-all duration-300 ${hasSaved ? 'bg-slate-100 text-slate-400 shadow-none cursor-not-allowed' : 'bg-globe-blue text-white shadow-globe-blue/20'}`}
-                  >
-                    {hasSaved ? 'SCORE SAVED!' : 'SAVE SCORE'}
-                  </button>
-                </div>
+                    <div className="grid grid-cols-2 gap-4 text-left">
+                      <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Primary Questions</p>
+                        <div className="flex justify-between items-center">
+                          <div className="flex items-center gap-1 text-globe-green">
+                            <CheckCircle2 className="w-4 h-4" />
+                            <span className="font-bold">{gameState.correctPrimary}</span>
+                          </div>
+                          <div className="flex items-center gap-1 text-red-500">
+                            <XCircle className="w-4 h-4" />
+                            <span className="font-bold">{gameState.wrongPrimary}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Bonus Questions</p>
+                        <div className="flex justify-between items-center">
+                          <div className="flex items-center gap-1 text-globe-yellow">
+                            <Star className="w-4 h-4 fill-globe-yellow" />
+                            <span className="font-bold">{gameState.correctBonus}</span>
+                          </div>
+                          <div className="flex items-center gap-1 text-slate-300">
+                            <XCircle className="w-4 h-4" />
+                            <span className="font-bold">{gameState.wrongBonus}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <button 
-                    onClick={startNewGame}
-                    className="bubbly-button bg-globe-green text-white py-4 rounded-2xl font-black flex items-center justify-center gap-2 shadow-lg shadow-globe-green/20"
-                  >
-                    <RotateCcw className="w-5 h-5" />
-                    RETRY
-                  </button>
+                    <div className="space-y-4">
+                      <div className="relative">
+                        <User className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+                        <input 
+                          type="text"
+                          placeholder="Your Explorer Name"
+                          value={playerName}
+                          onChange={(e) => {
+                            setPlayerName(e.target.value);
+                            localStorage.setItem('geoquiz_player_name', e.target.value);
+                          }}
+                          className="w-full pl-14 pr-5 py-4 bg-slate-50 border-2 border-slate-100 rounded-2xl focus:border-globe-blue focus:ring-0 transition-all font-bold text-lg text-slate-800"
+                        />
+                      </div>
+                      <button 
+                        onClick={() => saveScore(gameState.score, gameState.totalTime, gameState.difficulty, playerName)}
+                        disabled={hasSaved}
+                        className={`bubbly-button w-full py-4 rounded-2xl font-black text-lg shadow-lg transition-all duration-300 ${hasSaved ? 'bg-slate-100 text-slate-400 shadow-none cursor-not-allowed' : 'bg-globe-blue text-white shadow-globe-blue/20'}`}
+                      >
+                        {hasSaved ? 'SCORE SAVED!' : 'SAVE SCORE'}
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                <div className={`grid gap-3 ${gameState.mode === 'multiplayer' ? 'grid-cols-1' : 'grid-cols-2'}`}>
+                  {gameState.mode !== 'multiplayer' && (
+                    <button 
+                      onClick={startNewGame}
+                      className="bubbly-button bg-globe-green text-white py-4 rounded-2xl font-black flex items-center justify-center gap-2 shadow-lg shadow-globe-green/20"
+                    >
+                      <RotateCcw className="w-5 h-5" />
+                      RETRY
+                    </button>
+                  )}
                   <button 
                     onClick={backToMenu}
                     className="bubbly-button bg-white text-slate-600 py-4 rounded-2xl font-black border-2 border-slate-100 shadow-sm flex items-center justify-center gap-2"
@@ -1352,10 +1506,13 @@ export default function App() {
             >
               <div className="bg-white p-10 rounded-[2.5rem] shadow-2xl border border-slate-100 space-y-8">
                 <div className="text-center space-y-2">
-                  <div className="w-16 h-16 bg-globe-yellow/10 rounded-2xl flex items-center justify-center text-globe-yellow mx-auto border-2 border-globe-yellow/20">
+                  <div className="w-16 h-16 bg-globe-yellow/10 rounded-2xl flex items-center justify-center text-globe-yellow mx-auto border-2 border-globe-yellow/20 relative">
                     <Trophy className="w-8 h-8" />
+                    <div className="absolute -top-2 -right-2 bg-globe-blue text-white text-[8px] font-black px-2 py-1 rounded-full shadow-sm uppercase tracking-tighter">
+                      Global
+                    </div>
                   </div>
-                  <h2 className="text-3xl font-black text-slate-800">Hall of Fame</h2>
+                  <h2 className="text-3xl font-black text-slate-800">Global Hall of Fame</h2>
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 p-1 bg-slate-100 rounded-2xl">
@@ -1406,8 +1563,11 @@ export default function App() {
                       </div>
                     ))
                   ) : (
-                    <div className="text-center py-12 text-slate-300 italic font-medium">
-                      No legends yet...
+                    <div className="text-center py-12 space-y-4">
+                      <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center text-slate-200 mx-auto">
+                        <Globe className="w-8 h-8" />
+                      </div>
+                      <p className="text-slate-300 italic font-medium">No global legends yet for this difficulty...</p>
                     </div>
                   )}
                 </div>
