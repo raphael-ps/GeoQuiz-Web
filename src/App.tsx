@@ -154,8 +154,9 @@ export default function App() {
     const newSocket = io();
     setSocket(newSocket);
 
-    newSocket.on("waiting-for-opponent", () => {
+    newSocket.on("waiting-for-opponent", ({ roomId }) => {
       setMultiplayerStatus('waiting');
+      setGameState(prev => ({ ...prev, multiplayerRoomId: roomId }));
     });
 
     newSocket.on("duel-ready", ({ roomId, players }) => {
@@ -164,7 +165,7 @@ export default function App() {
         ...prev,
         gameStatus: 'multiplayer-game',
         multiplayerRoomId: roomId,
-        opponent: { name: opponent.name, score: 0 }
+        opponent: { name: opponent?.name || 'Opponent', score: 0 }
       }));
       setMultiplayerStatus('ready');
       startMultiplayerGame();
@@ -172,10 +173,12 @@ export default function App() {
 
     newSocket.on("duel-update", ({ players }) => {
       const opponent = players.find((p: any) => p.id !== newSocket.id);
-      setGameState(prev => ({
-        ...prev,
-        opponent: { ...prev.opponent!, score: opponent.score }
-      }));
+      if (opponent) {
+        setGameState(prev => ({
+          ...prev,
+          opponent: prev.opponent ? { ...prev.opponent, score: opponent.score } : { name: opponent.name, score: opponent.score }
+        }));
+      }
     });
 
     newSocket.on("player-left", () => {
@@ -326,8 +329,8 @@ export default function App() {
     const urlParams = new URLSearchParams(window.location.search);
     const roomId = urlParams.get('room');
     if (roomId && playerName && socket) {
-      joinDuel(roomId);
-      joinedViaUrl.current = true;
+      // Don't auto-join, just set the room ID so the UI can show a "Join Friend" button
+      setGameState(prev => ({ ...prev, multiplayerRoomId: roomId }));
     }
   }, [socket, playerName]);
 
@@ -477,7 +480,8 @@ export default function App() {
     const firstCountry = dataSet[Math.floor(Math.random() * dataSet.length)];
     const isHardOrXHard = selectedDifficulty === 'hard' || selectedDifficulty === 'extremely-hard';
     
-    setGameState({
+    setGameState(prev => ({
+      ...prev,
       score: 0,
       lives: INITIAL_LIVES,
       currentCountry: firstCountry,
@@ -494,9 +498,11 @@ export default function App() {
       wrongBonus: 0,
       isFlagRevealed: false,
       currentClipPath: isHardOrXHard ? generateRandomClipPath() : undefined
-    });
+    }));
     setTimeLeft(QUESTION_TIME);
     setGuessInput('');
+    setSelectedOption(null);
+    setIsCorrect(null);
   };
 
   const generateFlagQuestion = (country: Country, mode: GameState['mode']): Question => {
@@ -680,7 +686,26 @@ export default function App() {
     setSelectedOption(null);
     setIsCorrect(null);
     setTimeLeft(QUESTION_TIME);
-    setGameState(prev => ({ ...prev, gameStatus: 'landing', mode: null }));
+    
+    // Clear URL room parameter
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('room')) {
+      url.searchParams.delete('room');
+      window.history.replaceState({}, '', url.toString());
+    }
+
+    if (gameState.multiplayerRoomId) {
+      socket?.emit("leave-room", gameState.multiplayerRoomId);
+    }
+
+    setGameState(prev => ({ 
+      ...prev, 
+      gameStatus: 'landing', 
+      mode: null,
+      multiplayerRoomId: undefined,
+      opponent: undefined
+    }));
+    joinedViaUrl.current = false;
   };
 
   const showRanking = () => {
@@ -695,7 +720,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (gameState.gameStatus === 'question' && timeLeft > 0 && isCorrect === null) {
+    if ((gameState.gameStatus === 'question' || gameState.gameStatus === 'multiplayer-game') && timeLeft > 0 && isCorrect === null) {
       timerRef.current = setInterval(() => {
         setTimeLeft(prev => {
           if (prev <= 1) {
@@ -857,21 +882,34 @@ export default function App() {
                     <Calendar className="w-5 h-5 text-globe-blue" />
                     Daily
                   </button>
-                  <button 
-                    onClick={joinDuel}
-                    className="bubbly-button bg-white text-slate-700 py-4 rounded-2xl font-bold text-sm border-2 border-slate-100 shadow-sm flex flex-col items-center justify-center gap-1"
-                  >
-                    <Users className="w-5 h-5 text-purple-500" />
-                    Duel
-                  </button>
-                  <button 
-                    onClick={challengeFriend}
-                    className="bubbly-button bg-white text-slate-700 py-4 rounded-2xl font-bold text-sm border-2 border-slate-100 shadow-sm flex flex-col items-center justify-center gap-1"
-                  >
-                    <LinkIcon className="w-5 h-5 text-indigo-500" />
-                    Invite
-                  </button>
+                  {gameState.multiplayerRoomId && !joinedViaUrl.current ? (
+                    <button 
+                      onClick={() => {
+                        joinDuel(gameState.multiplayerRoomId);
+                        joinedViaUrl.current = true;
+                      }}
+                      className="bubbly-button bg-gradient-to-r from-purple-500 to-indigo-600 text-white py-4 rounded-2xl font-bold text-sm shadow-xl shadow-purple-500/20 flex flex-col items-center justify-center gap-1"
+                    >
+                      <Users className="w-5 h-5" />
+                      Join Duel
+                    </button>
+                  ) : (
+                    <button 
+                      onClick={() => joinDuel()}
+                      className="bubbly-button bg-white text-slate-700 py-4 rounded-2xl font-bold text-sm border-2 border-slate-100 shadow-sm flex flex-col items-center justify-center gap-1"
+                    >
+                      <Users className="w-5 h-5 text-purple-500" />
+                      Duel
+                    </button>
+                  )}
                 </div>
+                <button 
+                  onClick={challengeFriend}
+                  className="bubbly-button w-full bg-white text-slate-700 py-4 rounded-2xl font-bold text-sm border-2 border-slate-100 shadow-sm flex items-center justify-center gap-2"
+                >
+                  <LinkIcon className="w-5 h-5 text-indigo-500" />
+                  Invite Friend
+                </button>
                 <div className="grid grid-cols-2 gap-3">
                   <button 
                     onClick={showRanking}
@@ -1017,7 +1055,7 @@ export default function App() {
             </motion.div>
           )}
 
-          {gameState.gameStatus === 'question' && gameState.currentQuestion && (
+          {(gameState.gameStatus === 'question' || gameState.gameStatus === 'multiplayer-game') && gameState.currentQuestion && (
             <motion.div 
               key="question"
               initial={{ opacity: 0, x: 100 }}
@@ -1027,16 +1065,37 @@ export default function App() {
             >
               {/* Progress & Timer */}
               <div className="flex items-center justify-between gap-4">
-                <div className="flex-1 bg-white h-4 rounded-full border border-slate-100 p-1 shadow-inner">
-                  <motion.div 
-                    initial={{ width: 0 }}
-                    animate={{ width: `${(timeLeft / QUESTION_TIME) * 100}%` }}
-                    className={`h-full rounded-full transition-colors duration-500 ${timeLeft < 5 ? 'bg-red-500' : 'bg-globe-blue'}`}
-                  />
-                </div>
-                <div className={`w-12 h-12 rounded-full flex items-center justify-center font-black text-lg border-4 ${timeLeft < 5 ? 'bg-red-50 border-red-200 text-red-500 animate-pulse' : 'bg-white border-slate-100 text-slate-700'}`}>
-                  {timeLeft}
-                </div>
+                {gameState.gameStatus === 'multiplayer-game' && gameState.opponent ? (
+                  <div className="flex items-center gap-4 w-full">
+                    <div className="flex-1 bg-white p-3 rounded-2xl border border-slate-100 shadow-sm flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600 font-black text-xs">YOU</div>
+                        <span className="font-black text-slate-700">{gameState.score}</span>
+                      </div>
+                      <div className="h-4 w-[1px] bg-slate-100" />
+                      <div className="flex items-center gap-2">
+                        <span className="font-black text-slate-700">{gameState.opponent?.score || 0}</span>
+                        <div className="w-8 h-8 bg-purple-100 rounded-lg flex items-center justify-center text-purple-600 font-black text-xs">OPP</div>
+                      </div>
+                    </div>
+                    <div className={`w-12 h-12 rounded-full flex items-center justify-center font-black text-lg border-4 shrink-0 ${timeLeft < 5 ? 'bg-red-50 border-red-200 text-red-500 animate-pulse' : 'bg-white border-slate-100 text-slate-700'}`}>
+                      {timeLeft}
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex-1 bg-white h-4 rounded-full border border-slate-100 p-1 shadow-inner">
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ width: `${(timeLeft / QUESTION_TIME) * 100}%` }}
+                        className={`h-full rounded-full transition-colors duration-500 ${timeLeft < 5 ? 'bg-red-500' : 'bg-globe-blue'}`}
+                      />
+                    </div>
+                    <div className={`w-12 h-12 rounded-full flex items-center justify-center font-black text-lg border-4 ${timeLeft < 5 ? 'bg-red-50 border-red-200 text-red-500 animate-pulse' : 'bg-white border-slate-100 text-slate-700'}`}>
+                      {timeLeft}
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* Question Box */}

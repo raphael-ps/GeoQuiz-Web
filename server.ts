@@ -86,6 +86,23 @@ async function startServer() {
       io.to(roomId).emit("start-next-round");
     });
 
+    socket.on("leave-room", (roomId) => {
+      const room = rooms.get(roomId);
+      if (room) {
+        const index = room.players.findIndex(p => p.id === socket.id);
+        if (index !== -1) {
+          room.players.splice(index, 1);
+          socket.leave(roomId);
+          if (room.players.length === 0) {
+            rooms.delete(roomId);
+          } else {
+            io.to(roomId).emit("player-left");
+            room.status = "waiting";
+          }
+        }
+      }
+    });
+
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
       for (const [roomId, room] of rooms.entries()) {
